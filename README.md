@@ -4,7 +4,7 @@ It uses definition in accompanied json file.
 This will transfer ONLY body parts, no facial, as I use FaceIt to generate facial rig after this.
 
 Tested versions
-- Blender 2.92 LTS
+- Blender 2.93 LTS
 - Blender 3.1.2
 - AutoRig Pro 3.65.25
 - DazToBlender 2.4.0
