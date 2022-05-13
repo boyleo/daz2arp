@@ -3,6 +3,12 @@ This is helper Blender addon to rename/mix vertex group from Daz3D to AutoRig Pr
 It uses definition in accompanied json file.
 This will transfer ONLY body parts, no facial, as I use FaceIt to generate facial rig after this.
 
+Tested versions
+- Blender 2.92 LTS
+- Blender 3.1.2
+- AutoRig Pro 3.65.25
+- DazToBlender 2.4.0
+
 Usage
 1. Import Daz3d model via Daz To Blender addon
 2. Add new human armature from AutoRig Pro addon / Do not add secondary controllers
