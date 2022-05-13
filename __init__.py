@@ -3,13 +3,13 @@
 # - no secondary controllers
 # - edit limb option on spine for 4 spine bones to be compatible with UE4 mannequin
 # - edit limb options on both legs to have toe fingers
-# - add breasts / ears
+# - add breasts / ears (1 bone)
 
 bl_info = {
     "name": "Daz2ARP",
     "author": "Boonsak Watanavisit",
     "version": (1, 0),
-    "blender": (3, 1, 2),
+    "blender": (2, 93, 0),
     "location": "View3D",
     "description": "Rename/Remix vertex groups from Daz 3D model to AutoRig Pro",
     "warning": "",
@@ -22,11 +22,6 @@ import os
 import addon_utils
 from bpy.types import Operator
 import json
-
-
-def main(context):
-    for ob in context.scene.objects:
-        print(ob)
 
 def combine_vertex_group(v1, v2):
     bpy.ops.object.modifier_add(type='VERTEX_WEIGHT_MIX')
@@ -49,7 +44,6 @@ class Daz2arp_vertex_group_remap(bpy.types.Operator):
         return context.active_object is not None
 
     def execute(self, context):
-        # main(context)
         # load remap definition from json file
         file_name = "daz_to_arp_vertexgroups.json"
         
@@ -79,9 +73,24 @@ class Daz2arp_vertex_group_remap(bpy.types.Operator):
         
         # some bones are unavailable in ARP
         # so merge them with adjacent bones
-        combine_vertex_group("foot.l", "lMetatarsals")
-        combine_vertex_group("foot.r", "rMetatarsals")
-        combine_vertex_group("spine_03.x", "chestUpper")
+        try:
+            combine_vertex_group("foot.l", "lMetatarsals")
+        except:
+            self.report({'INFO'}, "lMetatarsals not merged")
+            bpy.ops.object.modifier_remove(modifier="foot.l")
+            
+        try:
+            combine_vertex_group("foot.r", "rMetatarsals")
+        except:
+            self.report({'INFO'}, "rMetatarsals not merged")
+            bpy.ops.object.modifier_remove(modifier="foot.r")
+            
+        try:
+            combine_vertex_group("spine_03.x", "chestUpper")
+        except:
+            self.report({'INFO'}, "chestUpper not merged")
+            bpy.ops.object.modifier_remove(modifier="spine_03.x")
+            
         return {'FINISHED'}
 
 def menu_func(self, context):
