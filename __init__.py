@@ -18,6 +18,8 @@ bl_info = {
 }
 
 import bpy
+import os
+import addon_utils
 from bpy.types import Operator
 import json
 
@@ -47,10 +49,16 @@ class Daz2arp_vertex_group_remap(bpy.types.Operator):
         return context.active_object is not None
 
     def execute(self, context):
-    #    main(context)
+        # main(context)
         # load remap definition from json file
-        file_name = "//daz_to_arp_vertexgroups.json"
-        absPath = bpy.path.abspath(file_name)
+        file_name = "daz_to_arp_vertexgroups.json"
+        
+        for mod in addon_utils.modules():
+            if mod.bl_info['name'] == "Daz2ARP":
+                filepath = mod.__file__
+            
+        absPath = os.path.dirname(filepath)+"\\"+file_name
+        
         with open(absPath) as f:
             vg = json.load(f)
 
