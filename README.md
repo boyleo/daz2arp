@@ -11,7 +11,7 @@ Tested versions
 
 Usage
 1. Import Daz3d model via Daz To Blender addon
-2. Add new human armature from AutoRig Pro addon / Do not add secondary controllers
+2. Add new human armature from AutoRig Pro addon / Add breasts and ears / Do not add secondary controllers
 3. Hide body mesh / Turn on vertex snapping
 4. ARP->Edit Reference Bones / manually snap each bones to the coresponding Daz ones.
 5. for spine, adjust limb options to have 4 spine bones
