@@ -8,16 +8,15 @@
 import ast
 import logging
 import math
-from operator import invert
 import traceback
 from dataclasses import dataclass
-from enum import Enum, Flag
+from enum import Flag
 from types import ModuleType
 from typing import Callable, Dict, List, Optional, Set, Union
 
 import bpy
-from mathutils import Vector
 import mathutils
+from mathutils import Vector, Euler
 
 bl_info = {
     "name": "Daz2ARP",
@@ -32,77 +31,7 @@ bl_info = {
 }
 
 
-def erc_keyed(var, min, max, normalized_dist, dist):
-    if dist < 0:
-        if max <= var <= min:
-            return abs((var - min) / dist)
-        elif max >= var:
-            return 1
-        else:
-            return 0
-    if min <= var <= max:
-        return abs((var - min * normalized_dist) / dist)
-    elif max <= var:
-        return 1
-    else:
-        return 0
-
-
-@bpy.app.handlers.persistent
-def load_handler(dummy):
-    dns = bpy.app.driver_namespace
-    dns["erc_keyed"] = erc_keyed
-
-
-class Daz2arp_vertex_group_remap(bpy.types.Operator):
-    """Remap Daz vertex group to AutoRig Pro"""
-    bl_idname = "mesh.daz2arp_vertex_group_remap"
-    bl_label = "Remap Daz Vertex Groups to AutoRig Pro"
-
-    @classmethod
-    def poll(cls, context):
-        return any(o.type == 'MESH' for o in context.selected_objects)
-
-    def combine_vertex_group(self, daz_object: bpy.types.Object, arp_vertex_group_name: str, daz_vertex_group_name: str):
-        try:
-            modifier: bpy.types.VertexWeightMixModifier = daz_object.modifiers.new(arp_vertex_group_name, type='VERTEX_WEIGHT_MIX')
-            modifier.vertex_group_a = arp_vertex_group_name
-            modifier.vertex_group_b = daz_vertex_group_name
-            modifier.mix_mode = 'ADD'
-            modifier.mix_set = 'ALL'
-            bpy.ops.object.modifier_apply(modifier=arp_vertex_group_name)
-        except:
-            logging.error(traceback.format_exc())
-            self.report({'WARNING'}, f"{daz_vertex_group_name} not merged in {daz_object.name}")
-            bpy.ops.object.modifier_remove(modifier=arp_vertex_group_name)
-
-    def execute(self, context):
-        # remap each vertex group
-        for obj in context.selected_objects:
-            if obj.type != 'MESH':
-                continue
-
-            for daz_name, arp_name in DAZ_TO_ARP_VERTEXGROUPS.items():
-                try:
-                    obj.vertex_groups[daz_name].name = arp_name
-                    obj.vertex_groups[arp_name].lock_weight = True
-                    self.report({'INFO'}, f"changed vertex group {daz_name} to {arp_name}")
-                except:
-                    self.report({'WARNING'}, f"vertext group {daz_name} not found in {obj.name}")
-
-            # some bones are unavailable in ARP
-            # so merge them with adjacent bones
-            self.combine_vertex_group(obj, "foot.l", "lMetatarsals")
-            self.combine_vertex_group(obj, "foot.r", "rMetatarsals")
-            # self.combine_vertex_group(obj, "spine_03.x", "chestUpper")
-
-        return {'FINISHED'}
-
-
-ReportFunctionType = Callable[[Union[Set[str], Set[int]], str], None]
-
-
-def try_import_module(name: str, package: Optional[str] = None) -> Optional[ModuleType]:
+def _try_import_module(name: str, package: Optional[str] = None) -> Optional[ModuleType]:
     import importlib
     try:
         return importlib.import_module(name, package)
@@ -110,13 +39,91 @@ def try_import_module(name: str, package: Optional[str] = None) -> Optional[Modu
         return None
 
 
-class D2A_OT_add_rig(bpy.types.Operator):
-    bl_idname = "mesh.daz2arp_add_rig"
-    bl_label = "XXXXXXXXXXXXXx"
+class D2A_OT_convert_daz_to_arp(bpy.types.Operator):
+    bl_idname = 'object.daz2arp_convert_daz_to_arp'
+    bl_label = "Convert Daz armature to AutoRig Pro"
     bl_options = {'REGISTER', 'UNDO'}
 
+    copy_daz_remaining_bones: bpy.props.BoolProperty(
+        name="Copy Daz Remaining Bones",
+        description="Copy non-body bones such as face and clothing to AutoRig Pro armature",
+        default=True,
+    )
+
+    remap_daz_corrective_shape_keys: bpy.props.BoolProperty(
+        name="Remap Daz Corrective Shape Keys",
+        description="Remap the mesh drivers",
+        default=True,
+    )
+
+    remap_daz_vertex_groups: bpy.props.BoolProperty(
+        name="Remap Daz Vertex Groups",
+        description="Remap the mesh vertex groups",
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        if context.mode != 'OBJECT':
+            return False
+
+        active_object = context.active_object
+        if active_object is None:
+            return False
+
+        if active_object.type != 'ARMATURE':
+            return False
+
+        return True
+
+    def execute(self, context):
+        # bpy.ops.ed.undo_push()
+
+        daz_armature_object = context.active_object
+        arp_armature_object = self._add_arp_rig(context)
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        daz_armature_object.select_set(True)
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        _snap_arp_ref_bones_to_daz_bones(arp_armature_object, daz_armature_object, self.report)
+
+        bpy.ops.arp.match_to_rig()
+
+        arp_armature_object = next(o for o in context.selected_objects if o.type == 'ARMATURE' and o != daz_armature_object)
+
+        bpy.ops.object.mode_set(mode='EDIT')
+        if self.copy_daz_remaining_bones:
+            _copy_daz_bones(arp_armature_object, daz_armature_object, self.report)
+        _fix_arp_bones(arp_armature_object)
+
+        bpy.ops.object.mode_set(mode='POSE')
+        _copy_daz_constraints(arp_armature_object, daz_armature_object, self.report)
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        _fix_daz_corrective_shape_keys(arp_armature_object, daz_armature_object, self.report)
+
+        if self.remap_daz_corrective_shape_keys:
+            _remap_daz_corrective_shape_keys(arp_armature_object, daz_armature_object, self.report)
+
+        if self.remap_daz_vertex_groups:
+            daz_mesh_object: bpy.types.Object
+            for daz_mesh_object in daz_armature_object.children:
+                if daz_mesh_object.type != 'MESH':
+                    continue
+
+                _remap_daz_vertex_groups(daz_mesh_object, self.report)
+                daz_mesh_object.parent = arp_armature_object
+
+                for modifier in daz_mesh_object.modifiers:
+                    if modifier.type != 'ARMATURE':
+                        continue
+                    modifier.object = arp_armature_object
+
+        return {'FINISHED'}
+
     def _add_arp_rig(self, context: bpy.types.Context) -> bpy.types.Object:
-        arp = try_import_module('auto_rig_pro-master.auto_rig') or try_import_module('auto_rig_pro.auto_rig')
+        arp = _try_import_module('auto_rig_pro-master.auto_rig') or _try_import_module('auto_rig_pro.auto_rig')
         if arp is None:
             self.report({'ERROR'}, "Auto-Rig Pro is not installed.")
             return {'CANCELLED'}
@@ -145,42 +152,22 @@ class D2A_OT_add_rig(bpy.types.Operator):
         # adjust legs
         select_bone('thigh_ref.l')
         arp.set_toes(True, True, True, True, True)
-        # arp.set_leg_auto_ik_roll(False)
         select_bone('thigh_ref.r')
         arp.set_toes(True, True, True, True, True)
-        # arp.set_leg_auto_ik_roll(False)
+
+        # add ears
+        arp.set_ears(1)
+
+        # add breast
+        arp.set_breast(True)
 
         return armature_object
 
-    @classmethod
-    def poll(cls, context):
-        if context.mode != 'OBJECT':
-            return False
 
-        active_object = context.active_object
-        if active_object is None:
-            return False
-
-        if active_object.type != 'ARMATURE':
-            return False
-
-        return True
-
-    def execute(self, context):
-        daz_armature_object = context.active_object
-        arp_armature_object = self._add_arp_rig(context)
-
-        bpy.ops.object.mode_set(mode='OBJECT')
-        daz_armature_object.select_set(True)
-        bpy.ops.object.mode_set(mode='EDIT')
-        snap_arp_ref_bones_to_daz_bones(arp_armature_object, daz_armature_object, self.report)
-
-        bpy.ops.arp.match_to_rig()
-
-        return {'FINISHED'}
+_ReportFunctionType = Callable[[Union[Set[str], Set[int]], str], None]
 
 
-def snap_arp_ref_bones_to_daz_bones(arp_armature_object: bpy.types.Object, daz_armature_object: bpy.types.Object, report: Optional[ReportFunctionType] = None):
+def _snap_arp_ref_bones_to_daz_bones(arp_armature_object: bpy.types.Object, daz_armature_object: bpy.types.Object, report: Optional[_ReportFunctionType] = None):
     arp_armature: bpy.types.Armature = arp_armature_object.data
     arp_bones = arp_armature.edit_bones
     daz_armature: bpy.types.Armature = daz_armature_object.data
@@ -203,22 +190,26 @@ def snap_arp_ref_bones_to_daz_bones(arp_armature_object: bpy.types.Object, daz_a
         daz_side = daz_name[0] if daz_name[0] in {'l', 'r'} else ''
         daz_bone = daz_bones[daz_name]
 
-        arp_bone.align_roll(daz_bone.z_axis)
-
         snap_type = bone_snap_info.snap_type
+
+        if BoneSnapType.BREAST != snap_type:
+            arp_bone.roll = daz_bone.roll
+        else:
+            vector = arp_bone.vector
+            arp_bone.head = daz_bone.head
+            arp_bone.tail = daz_bone.head + vector
+
         if BoneSnapType.DISCONNECTED in snap_type:
             arp_bone.use_connect = False
 
         if BoneSnapType.HEAD in snap_type:
             arp_bone.head = daz_bone.head.copy()
-            # arp_bone.roll = daz_bone.roll
-            # arp_bone.align_orientation(daz_bone)
 
         if BoneSnapType.TAIL in snap_type:
             if BoneSnapType.FLIPPED in snap_type:
                 arp_bone.head = daz_bone.tail.copy()
                 arp_bone.tail = daz_bone.head.copy()
-                arp_bone.align_roll(-daz_bone.z_axis)
+                arp_bone.roll += math.pi
             else:
                 arp_bone.tail = daz_bone.tail.copy()
 
@@ -227,11 +218,7 @@ def snap_arp_ref_bones_to_daz_bones(arp_armature_object: bpy.types.Object, daz_a
             arp_bone.head = (2 * daz_bone.head) - (1 * daz_bone.tail)
 
         if BoneSnapType.SHIN in snap_type:
-            daz_child_bone = daz_bone.children[0]
-            daz_thightwist = daz_bones[f'{daz_side}ThighTwist']
-            arp_bone.head = (daz_bone.head + daz_thightwist.tail) / 2
-            arp_bone.tail = (2 * daz_child_bone.head) - (1 * daz_child_bone.tail)
-            arp_bone.roll += math.pi / 2
+            arp_bone.tail = daz_bones[f'{daz_side}Foot'].head
 
         if BoneSnapType.ANKLE in snap_type:
             arp_bone.tail = daz_bones[f'{daz_side}Toe'].head.copy()
@@ -261,188 +248,7 @@ def snap_arp_ref_bones_to_daz_bones(arp_armature_object: bpy.types.Object, daz_a
             arp_foot_bank_02_ref.tail = arp_foot_bank_02_ref.head + daz_foot_vector * arp_foot_heel_ref_length
 
 
-class Daz2arp_bone_snap(bpy.types.Operator):
-    """Snap AutoRig Pro reference bones to Daz"""
-    bl_idname = "mesh.daz2arp_bone_snap"
-    bl_label = "Copy Bones"
-
-    @classmethod
-    def poll(cls, context):
-        if context.mode != 'OBJECT':
-            return False
-
-        active_object = context.active_object
-        if active_object is None:
-            return False
-
-        if active_object.type != 'ARMATURE':
-            return False
-
-        # ARP objects have 'als' custom property.
-        if 'als' not in active_object:
-            return False
-
-        # 2 armature objects must be selected.
-        return sum(1 for o in context.selected_objects if o.type == 'ARMATURE') == 2
-
-    def execute(self, context):
-        arp_armature_object = context.active_object
-        daz_armature_object = next(o for o in context.selected_objects if o.type == 'ARMATURE' and o != arp_armature_object)
-
-        bpy.ops.object.mode_set(mode='EDIT')
-        copy_daz_bones(arp_armature_object, daz_armature_object, self.report)
-        fix_arp_bones(arp_armature_object, daz_armature_object, self.report)
-
-        bpy.ops.object.mode_set(mode='POSE')
-        # copy_daz_constraints(arp_armature_object, daz_armature_object, self.report)
-
-        bpy.ops.object.mode_set(mode='OBJECT')
-        fix_daz_corrective_shape_keys(arp_armature_object, daz_armature_object, self.report)
-        adjust_daz_corrective_shape_keys(arp_armature_object, daz_armature_object, self.report)
-
-        return {'FINISHED'}
-
-
-class NameGather(ast.NodeVisitor):
-    def __init__(self):
-        self._names: Set[str] = set()
-
-    def visit(self, node: ast.AST):
-        if isinstance(node, ast.Name):
-            name_node: ast.Name = node
-            self._names.add(name_node.id)
-
-        return self.generic_visit(node)
-
-    def get_names(self) -> Set[str]:
-        return self._names
-
-def fix_daz_corrective_shape_keys(arp_armature_object: bpy.types.Object, daz_armature_object: bpy.types.Object, report: Optional[ReportFunctionType] = None):
-
-    mesh_object: bpy.types.Object
-    for mesh_object in daz_armature_object.children_recursive:
-        if mesh_object.type != 'MESH':
-            continue
-
-        mesh: bpy.types.Mesh = mesh_object.data
-        for fcurve in mesh.shape_keys.animation_data.drivers:
-            driver = fcurve.driver
-            name_gather = NameGather()
-            name_gather.visit(ast.parse(driver.expression))
-            expression_names = name_gather.get_names()
-
-            for variable in driver.variables:
-                if variable.name not in expression_names:
-                    # remove unused variable
-                    driver.variables.remove(variable)
-                    continue
-            
-            if 'ForeArmFwd_135_L' in fcurve.data_path:
-                # fix DazToBlender bug
-                driver.expression = driver.expression.replace("57.3),0.0,135.0,1,135.0)", "57.3),75,135,1,60.0)")
-
-
-def adjust_daz_corrective_shape_keys(arp_armature_object: bpy.types.Object, daz_armature_object: bpy.types.Object, report: Optional[ReportFunctionType] = None):
-    arp_armature: bpy.types.Armature = arp_armature_object.data
-    arp_bones = arp_armature.bones
-    daz_armature: bpy.types.Armature = daz_armature_object.data
-    daz_bones = daz_armature.bones
-
-    mesh_object: bpy.types.Object
-    for mesh_object in daz_armature_object.children_recursive:
-        if mesh_object.type != 'MESH':
-            continue
-
-        mesh: bpy.types.Mesh = mesh_object.data
-        for fcurve in mesh.shape_keys.animation_data.drivers:
-            if not fcurve.data_path.startswith('key_blocks["pJCM'):
-                continue
-
-            driver = fcurve.driver
-            for variable in driver.variables:
-                if variable.type != 'TRANSFORMS':
-                    continue
-
-                target = variable.targets[0]
-                daz_bone_name = target.bone_target
-                arp_bone_name = DAZ_TO_ARP_VERTEXGROUPS.get(daz_bone_name)
-                if arp_bone_name is None:
-                    report({'WARNING'}, f'Not found {daz_bone_name}')
-                    continue
-
-                # print(f'{fcurve.data_path}: {daz_bone_name},\t{target.transform_type},\t{variable.name},\t{driver.expression}')
-
-                bone_roll_info = ARP_REF_BONE_ROLL_INFOS.get(arp_bone_name)
-
-                if bone_roll_info is None:
-                    continue
-
-                target.id = arp_armature_object
-                target.bone_target = arp_bone_name if bone_roll_info.override_bone_name is None else bone_roll_info.override_bone_name
-
-                if bone_roll_info.roll_type == BoneRollType.ROLL_0:
-                    continue
-
-                def invert_expression():
-                    driver.expression = driver.expression.replace(variable.name, f'(-{variable.name})')
-
-                def set_roll_axis(transform_type: str, invert: bool = False):
-                    target.transform_type = transform_type
-                    if invert:
-                        invert_expression()
-
-                if bone_roll_info.roll_type == BoneRollType.ROLL_DIFFERENCE:
-                    variable.type = 'ROTATION_DIFF'
-                    variable.targets[1].id = arp_armature_object
-                    variable.targets[1].bone_target = bone_roll_info.difference_bone_name
-                    if bone_roll_info.difference_invert:
-                        invert_expression()
-
-                elif bone_roll_info.roll_type == BoneRollType.ROLL_90:
-                    # +90: X>+Z, Z>-X
-                    if target.transform_type == 'ROT_X':
-                        set_roll_axis('ROT_Z')
-                    elif target.transform_type == 'ROT_Z':
-                        set_roll_axis('ROT_X', invert=True)
-
-                elif bone_roll_info.roll_type == BoneRollType.ROLL_180:
-                    # +180: X>-X, Z>-Z
-                    if target.transform_type == 'ROT_X':
-                        set_roll_axis('ROT_X', invert=True)
-                    elif target.transform_type == 'ROT_Z':
-                        set_roll_axis('ROT_Z', invert=True)
-
-                elif bone_roll_info.roll_type == BoneRollType.ROLL_270:
-                    # +270: X>-Z, Z>+X
-                    if target.transform_type == 'ROT_X':
-                        set_roll_axis('ROT_Z', invert=True)
-                    elif target.transform_type == 'ROT_Z':
-                        set_roll_axis('ROT_X')
-
-                    # if ((BoneAxisRollType.X in bone_axis_type and target.transform_type == 'ROT_X')
-                    #  or (BoneAxisRollType.Y in bone_axis_type and target.transform_type == 'ROT_Y')
-                    #  or (BoneAxisRollType.Z in bone_axis_type and target.transform_type == 'ROT_Z')):
-                    #     if BoneAxisRollType.TO_X in bone_axis_type:
-                    #         target.transform_type = 'ROT_X'
-                    #     elif BoneAxisRollType.TO_Y in bone_axis_type:
-                    #         target.transform_type = 'ROT_Y'
-                    #     elif BoneAxisRollType.TO_Z in bone_axis_type:
-                    #         target.transform_type = 'ROT_Z'
-
-                    # if BoneAxisRollType.INVERT in bone_axis_type:
-                    #     driver.expression = driver.expression.replace(variable.name, f'(-{variable.name})')
-
-
-def fix_arp_bones(arp_armature_object: bpy.types.Object, daz_armature_object: bpy.types.Object, report: Optional[ReportFunctionType] = None):
-    arp_armature: bpy.types.Armature = arp_armature_object.data
-    arp_bones = arp_armature.edit_bones
-    daz_armature: bpy.types.Armature = daz_armature_object.data
-    daz_bones = daz_armature.edit_bones
-
-    arp_bones['hand.l'].use_inherit_rotation = True
-    arp_bones['hand.r'].use_inherit_rotation = True
-
-def copy_daz_bones(arp_armature_object: bpy.types.Object, daz_armature_object: bpy.types.Object, report: Optional[ReportFunctionType] = None):
+def _copy_daz_bones(arp_armature_object: bpy.types.Object, daz_armature_object: bpy.types.Object, report: Optional[_ReportFunctionType] = None):
     arp_armature: bpy.types.Armature = arp_armature_object.data
     arp_bones = arp_armature.edit_bones
     daz_armature: bpy.types.Armature = daz_armature_object.data
@@ -472,8 +278,7 @@ def copy_daz_bones(arp_armature_object: bpy.types.Object, daz_armature_object: b
         new_arp_bone.parent = arp_parent_bone
         new_arp_bone.head = daz_bone.head
         new_arp_bone.tail = daz_bone.tail
-        new_arp_bone.align_orientation(daz_bone)
-        # new_arp_bone.align_roll(daz_bone.z_axis)
+        new_arp_bone.roll = daz_bone.roll
         new_arp_bone.use_deform = daz_bone.use_deform
         new_arp_bone.use_connect = daz_bone.use_connect
         new_arp_bone.layers = [i in {24} for i in range(32)]
@@ -485,65 +290,272 @@ def copy_daz_bones(arp_armature_object: bpy.types.Object, daz_armature_object: b
         duplicate_bones_recursively(daz_bone, arp_bone)
 
 
-def copy_daz_constraints(arp_armature_object: bpy.types.Object, daz_armature_object: bpy.types.Object, report: Optional[ReportFunctionType] = None):
+def _fix_arp_bones(arp_armature_object: bpy.types.Object):
+    arp_armature: bpy.types.Armature = arp_armature_object.data
+    arp_bones = arp_armature.edit_bones
+
+    # connect the hand bones to get the correct angle for Corrective Shape Keys
+    arp_bones['hand.l'].use_inherit_rotation = True
+    arp_bones['hand.r'].use_inherit_rotation = True
+
+
+def _copy_daz_constraints(arp_armature_object: bpy.types.Object, daz_armature_object: bpy.types.Object, report: Optional[_ReportFunctionType] = None):
     arp_bones = arp_armature_object.pose.bones
     daz_bones = daz_armature_object.pose.bones
 
     for daz_bone in daz_bones:
+        roll_type, arp_bone_name, arp_parent_bone_name = ARP_BONE_LIMIT_ROTATION_BASES.get(daz_bone.name, (BoneRollType.ROLL_0, None, None))
+
         arp_bone: bpy.types.PoseBone
-        if daz_bone.name in DAZ_TO_ARP_VERTEXGROUPS:
-            arp_bone = arp_bones.get(DAZ_TO_ARP_VERTEXGROUPS[daz_bone.name])
+        if arp_bone_name is not None:
+            arp_bone = arp_bones[arp_bone_name]
         elif daz_bone.name in arp_bones:
             arp_bone = arp_bones[daz_bone.name]
         else:
             continue
 
         for daz_constraint in daz_bone.constraints:
-            if daz_constraint.type == 'LIMIT_ROTATION':
-                dc: bpy.types.LimitRotationConstraint = daz_constraint
-                ac: bpy.types.LimitRotationConstraint = arp_bone.constraints.new(type='LIMIT_ROTATION')
-                ac.name = dc.name
-                ac.use_limit_x, ac.min_x, ac.max_x = dc.use_limit_x, dc.min_x, dc.max_x
-                ac.use_limit_y, ac.min_y, ac.max_y = dc.use_limit_y, dc.min_y, dc.max_y
-                ac.use_limit_z, ac.min_z, ac.max_z = dc.use_limit_z, dc.min_z, dc.max_z
-                ac.euler_order = dc.euler_order
-                ac.use_transform_limit = dc.use_transform_limit
+            if daz_constraint.type != 'LIMIT_ROTATION':
+                continue
+
+            dc: bpy.types.LimitRotationConstraint = daz_constraint
+            ac: bpy.types.LimitRotationConstraint = arp_bone.constraints.new(type='LIMIT_ROTATION')
+            ac.name = dc.name
+            ac.use_limit_x, ac.min_x, ac.max_x = dc.use_limit_x, dc.min_x, dc.max_x
+            ac.use_limit_y, ac.min_y, ac.max_y = dc.use_limit_y, dc.min_y, dc.max_y
+            ac.use_limit_z, ac.min_z, ac.max_z = dc.use_limit_z, dc.min_z, dc.max_z
+            ac.euler_order = dc.euler_order
+            ac.use_transform_limit = dc.use_transform_limit
+
+            if arp_parent_bone_name is None:
                 ac.owner_space = dc.owner_space
+                continue
+
+            continue
+            # TODO calculate the angle considering bone orientation and parent angle difference.
+            arp_parent_bone = arp_bones[arp_parent_bone_name]
+            arp_parent_vector: Vector = arp_parent_bone.vector
+            daz_parent_vector: Vector = daz_bone.parent.vector
+            base_euler: Euler = arp_bone.vector.rotation_difference(daz_bone.vector).to_euler()
+            parent_euler: Euler = arp_parent_bone.vector.rotation_difference(daz_bone.parent.vector).to_euler()
+            daz_euler: Euler = arp_bone.vector.rotation_difference(daz_bone.parent.vector).to_euler()
+            ac.min_x += parent_euler.x - base_euler.x + daz_euler.x
+            ac.max_x += parent_euler.x - base_euler.x + daz_euler.x
+            ac.min_y += parent_euler.y - base_euler.y + daz_euler.y
+            ac.max_y += parent_euler.y - base_euler.y + daz_euler.y
+            ac.min_z += parent_euler.z - base_euler.z + daz_euler.z
+            ac.max_z += parent_euler.z - base_euler.z + daz_euler.z
+
+            ac.owner_space = 'CUSTOM'
+            ac.space_object = arp_armature_object
+            ac.space_subtarget = arp_parent_bone_name
 
 
-class DAZ2ARP_MT_object_menu(bpy.types.Menu):
-    bl_label = 'Daz to AutoRig Pro'
+def _fix_daz_corrective_shape_keys(arp_armature_object: bpy.types.Object, daz_armature_object: bpy.types.Object, report: Optional[_ReportFunctionType] = None):
+    class NameCollector(ast.NodeVisitor):
+        def __init__(self):
+            self._names: Set[str] = set()
 
-    def draw(self, _context):
-        self.layout.operator(D2A_OT_add_rig.bl_idname, text=D2A_OT_add_rig.bl_label)
-        self.layout.operator(Daz2arp_vertex_group_remap.bl_idname, text=Daz2arp_vertex_group_remap.bl_label)
-        self.layout.operator(Daz2arp_bone_snap.bl_idname, text=Daz2arp_bone_snap.bl_label)
+        def visit(self, node: ast.AST):
+            if isinstance(node, ast.Name):
+                name_node: ast.Name = node
+                self._names.add(name_node.id)
 
-    def menu_func(self, _context):
-        self.layout.menu(DAZ2ARP_MT_object_menu.__name__, text=DAZ2ARP_MT_object_menu.bl_label)
+            return self.generic_visit(node)
+
+        def get_names(self) -> Set[str]:
+            return self._names
+
+    mesh_object: bpy.types.Object
+    for mesh_object in daz_armature_object.children_recursive:
+        if mesh_object.type != 'MESH':
+            continue
+
+        mesh: bpy.types.Mesh = mesh_object.data
+        for fcurve in mesh.shape_keys.animation_data.drivers:
+            driver = fcurve.driver
+            name_collector = NameCollector()
+            name_collector.visit(ast.parse(driver.expression))
+            expression_names = name_collector.get_names()
+
+            for variable in driver.variables:
+                if variable.name not in expression_names:
+                    # remove unused variable
+                    driver.variables.remove(variable)
+                    continue
+
+            if 'ForeArmFwd_135_L' in fcurve.data_path:
+                # fix DazToBlender bug https://github.com/daz3d/DazToBlender/issues/151
+                driver.expression = driver.expression.replace("57.3),0.0,135.0,1,135.0)", "57.3),75,135,1,60.0)")
+
+
+def _remap_daz_corrective_shape_keys(arp_armature_object: bpy.types.Object, daz_armature_object: bpy.types.Object, report: Optional[_ReportFunctionType] = None):
+    mesh_object: bpy.types.Object
+    for mesh_object in daz_armature_object.children_recursive:
+        if mesh_object.type != 'MESH':
+            continue
+
+        mesh: bpy.types.Mesh = mesh_object.data
+        for fcurve in mesh.shape_keys.animation_data.drivers:
+            if not fcurve.data_path.startswith('key_blocks["pJCM'):
+                continue
+
+            driver = fcurve.driver
+            variable_names_to_ignore: Set[str] = set()
+
+            for variable in driver.variables:
+                if variable.type != 'TRANSFORMS':
+                    continue
+
+                if variable.name in variable_names_to_ignore:
+                    continue
+
+                target = variable.targets[0]
+                daz_bone_name = target.bone_target
+                arp_bone_name = DAZ_TO_ARP_VERTEXGROUPS.get(daz_bone_name)
+                if arp_bone_name is None:
+                    if report:
+                        report({'WARNING'}, f'Not found {daz_bone_name}')
+                    continue
+
+                bone_roll_info = ARP_REF_BONE_ROLL_INFOS.get(arp_bone_name)
+
+                if bone_roll_info is None:
+                    continue
+
+                target.id = arp_armature_object
+                target.bone_target = arp_bone_name if bone_roll_info.override_bone_name is None else bone_roll_info.override_bone_name
+
+                if BoneRollType.ROLL_0 == bone_roll_info.roll_type:
+                    continue
+
+                if BoneRollType.ROLL_ADD_BONES in bone_roll_info.roll_type:
+                    target_variable_names: List[str] = [variable.name]
+                    for add_bone_name in bone_roll_info.add_bone_names:
+                        new_variable = driver.variables.new()
+                        new_variable.type = variable.type
+                        new_variable.targets[0].id = variable.targets[0].id
+                        new_variable.targets[0].transform_type = variable.targets[0].transform_type
+                        new_variable.targets[0].transform_space = variable.targets[0].transform_space
+
+                        new_variable.targets[0].bone_target = add_bone_name
+                        target_variable_names.append(new_variable.name)
+
+                    driver.expression = driver.expression.replace(variable.name, f"({'+'.join(target_variable_names)})")
+                    variable_names_to_ignore.update(target_variable_names)
+
+                def invert_expression():
+                    driver.expression = driver.expression.replace(variable.name, f'(-{variable.name})')
+
+                def set_roll_axis(transform_type: str, invert: bool = False):
+                    target.transform_type = transform_type
+                    if invert:
+                        invert_expression()
+
+                if BoneRollType.ROLL_DIFFERENCE in bone_roll_info.roll_type:
+                    variable.type = 'ROTATION_DIFF'
+                    variable.targets[1].id = arp_armature_object
+                    variable.targets[1].bone_target = bone_roll_info.difference_bone_name
+                    if bone_roll_info.difference_invert:
+                        invert_expression()
+
+                elif BoneRollType.ROLL_90 in bone_roll_info.roll_type:
+                    # +90: X>+Z, Z>-X
+                    if target.transform_type == 'ROT_X':
+                        set_roll_axis('ROT_Z')
+                    elif target.transform_type == 'ROT_Z':
+                        set_roll_axis('ROT_X', invert=True)
+
+                elif BoneRollType.ROLL_180 in bone_roll_info.roll_type:
+                    # +180: X>-X, Z>-Z
+                    if target.transform_type == 'ROT_X':
+                        set_roll_axis('ROT_X', invert=True)
+                    elif target.transform_type == 'ROT_Z':
+                        set_roll_axis('ROT_Z', invert=True)
+
+                elif BoneRollType.ROLL_270 in bone_roll_info.roll_type:
+                    # +270: X>-Z, Z>+X
+                    if target.transform_type == 'ROT_X':
+                        set_roll_axis('ROT_Z', invert=True)
+                    elif target.transform_type == 'ROT_Z':
+                        set_roll_axis('ROT_X')
+
+
+def _remap_daz_vertex_groups(daz_mesh_object: bpy.types.Object, report: Optional[_ReportFunctionType] = None):
+    for daz_name, arp_name in DAZ_TO_ARP_VERTEXGROUPS.items():
+        try:
+            vertex_group = daz_mesh_object.vertex_groups[daz_name]
+            vertex_group.name = arp_name
+            vertex_group.lock_weight = True
+        except:
+            if report:
+                report({'WARNING'}, f"vertext group {daz_name} not found in {daz_mesh_object.name}")
+
+    def combine_vertex_group(arp_vertex_group_name: str, daz_vertex_group_name: str):
+        try:
+            modifier: bpy.types.VertexWeightMixModifier = daz_mesh_object.modifiers.new(arp_vertex_group_name, type='VERTEX_WEIGHT_MIX')
+            modifier.vertex_group_a = arp_vertex_group_name
+            modifier.vertex_group_b = daz_vertex_group_name
+            modifier.mix_mode = 'ADD'
+            modifier.mix_set = 'ALL'
+            bpy.ops.object.modifier_apply({'object': daz_mesh_object}, modifier=arp_vertex_group_name)
+        except:
+            logging.error(traceback.format_exc())
+            if report:
+                report({'WARNING'}, f"{daz_vertex_group_name} not merged in {daz_mesh_object.name}")
+            bpy.ops.object.modifier_remove({'object': daz_mesh_object}, modifier=arp_vertex_group_name)
+
+    # some bones are unavailable in ARP
+    # so merge them with adjacent bones
+    combine_vertex_group('foot.l', 'lMetatarsals')
+    combine_vertex_group('foot.r', 'rMetatarsals')
+
+
+def menu_func(self, _context):
+    self.layout.operator(D2A_OT_convert_daz_to_arp.bl_idname, text=D2A_OT_convert_daz_to_arp.bl_label)
+
+
+def _erc_keyed(var, min, max, normalized_dist, dist):
+    """Converts difference to a 0 to 1 range
+    see: https://github.com/daz3d/DazToBlender/blob/1bcb95f6e0e4c901a1f99c350e6334cfae2cf96c/Blender/appdata_common/Blender%20Foundation/Blender/BLENDER_VERSION/scripts/addons/DTB/__init__.py#L294
+    """
+    if dist < 0:
+        if max <= var <= min:
+            return abs((var - min) / dist)
+        elif max >= var:
+            return 1
+        else:
+            return 0
+    if min <= var <= max:
+        return abs((var - min * normalized_dist) / dist)
+    elif max <= var:
+        return 1
+    else:
+        return 0
+
+
+@bpy.app.handlers.persistent
+def _load_handler(dummy):
+    dns = bpy.app.driver_namespace
+    if not hasattr(dns, 'erc_keyed'):
+        dns['erc_keyed'] = _erc_keyed
 
 
 def register():
     """Register and add to the "object" menu (required to also use F3 search "Simple Object Operator" for quick access)"""
-    load_handler(None)
-    bpy.app.handlers.load_post.append(load_handler)
-    bpy.utils.register_class(Daz2arp_vertex_group_remap)
-    bpy.utils.register_class(Daz2arp_bone_snap)
-    bpy.utils.register_class(DAZ2ARP_MT_object_menu)
-    bpy.utils.register_class(D2A_OT_add_rig)
-    bpy.types.VIEW3D_MT_object.append(DAZ2ARP_MT_object_menu.menu_func)
+    _load_handler(None)
+    bpy.app.handlers.load_post.append(_load_handler)
+    bpy.utils.register_class(D2A_OT_convert_daz_to_arp)
+    bpy.types.VIEW3D_MT_object.append(menu_func)
 
 
 def unregister():
-    bpy.types.VIEW3D_MT_object.remove(DAZ2ARP_MT_object_menu.menu_func)
-    bpy.utils.unregister_class(D2A_OT_add_rig)
-    bpy.utils.unregister_class(DAZ2ARP_MT_object_menu)
-    bpy.utils.unregister_class(Daz2arp_bone_snap)
-    bpy.utils.unregister_class(Daz2arp_vertex_group_remap)
-    bpy.app.handlers.load_post.remove(load_handler)
+    bpy.types.VIEW3D_MT_object.remove(menu_func)
+    bpy.utils.unregister_class(D2A_OT_convert_daz_to_arp)
+    bpy.app.handlers.load_post.remove(_load_handler)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     register()
 
 
@@ -644,19 +656,22 @@ DAZ_TO_ARP_VERTEXGROUPS = {
     "neckUpper": "neck.x",
     "head": "head.x",
 
-    # "lEar": "c_ear_01.l",
-    # "rEar": "c_ear_01.r",
-    # "lPectoral": "c_breast_01.l",
-    # "rPectoral": "c_breast_01.r",
+    "lEar": "c_ear_01.l",
+    "rEar": "c_ear_01.r",
+    "lPectoral": "c_breast_01.l",
+    "rPectoral": "c_breast_01.r",
 }
 
 
-class BoneRollType(Enum):
+class BoneRollType(Flag):
     ROLL_0 = 0
     ROLL_90 = 1
     ROLL_180 = 2
     ROLL_270 = 4
     ROLL_DIFFERENCE = 8
+    ROLL_ADD_BONES = 16
+
+    ROLL_SPINE = ROLL_0 | ROLL_ADD_BONES
 
 
 @dataclass
@@ -665,13 +680,14 @@ class BoneRollInfo:
     override_bone_name: str = None
     difference_bone_name: str = None
     difference_invert: bool = False
+    add_bone_names: List[str] = None
 
 
 ARP_REF_BONE_ROLL_INFOS: Dict[str, BoneRollInfo] = {
     'root.x': BoneRollInfo(BoneRollType.ROLL_0, 'c_root.x'),
-    'spine_01.x': BoneRollInfo(BoneRollType.ROLL_0, 'c_spine_01.x'),
-    'spine_02.x': BoneRollInfo(BoneRollType.ROLL_0, 'c_spine_02.x'),
-    'spine_03.x': BoneRollInfo(BoneRollType.ROLL_0, 'c_spine_03.x'),
+    'spine_01.x': BoneRollInfo(BoneRollType.ROLL_SPINE, 'c_spine_01.x', add_bone_names=['spine_01_cns.x']),
+    'spine_02.x': BoneRollInfo(BoneRollType.ROLL_SPINE, 'c_spine_02.x', add_bone_names=['spine_02_cns.x']),
+    'spine_03.x': BoneRollInfo(BoneRollType.ROLL_SPINE, 'c_spine_03.x', add_bone_names=['spine_03_cns.x']),
 
     'thigh_twist.l': BoneRollInfo(BoneRollType.ROLL_90),
     'thigh_twist.r': BoneRollInfo(BoneRollType.ROLL_270),
@@ -688,8 +704,8 @@ ARP_REF_BONE_ROLL_INFOS: Dict[str, BoneRollInfo] = {
     'shoulder.r': BoneRollInfo(BoneRollType.ROLL_180),
     'c_arm_twist_offset.l': BoneRollInfo(BoneRollType.ROLL_0, 'arm_twist.l'),
     'c_arm_twist_offset.r': BoneRollInfo(BoneRollType.ROLL_180, 'arm_twist.r'),
-    'forearm_stretch.l':  BoneRollInfo(BoneRollType.ROLL_DIFFERENCE, difference_bone_name='arm_stretch.l', difference_invert=False),
-    'forearm_stretch.r':  BoneRollInfo(BoneRollType.ROLL_DIFFERENCE, difference_bone_name='arm_stretch.r', difference_invert=True),
+    'forearm_stretch.l':  BoneRollInfo(BoneRollType.ROLL_270),
+    'forearm_stretch.r':  BoneRollInfo(BoneRollType.ROLL_270),
     'hand.l': BoneRollInfo(BoneRollType.ROLL_0),
     'hand.r': BoneRollInfo(BoneRollType.ROLL_180),
 
@@ -697,6 +713,8 @@ ARP_REF_BONE_ROLL_INFOS: Dict[str, BoneRollInfo] = {
     'neck.x': BoneRollInfo(BoneRollType.ROLL_0, 'c_neck.x'),
     'head.x': BoneRollInfo(BoneRollType.ROLL_0, 'c_head.x'),
 }
+
+ARP_BONE_LIMIT_ROTATION_BASES = {}
 
 
 class BoneSnapType(Flag):
@@ -707,6 +725,7 @@ class BoneSnapType(Flag):
     FOOT_PROXIMAL = 16
     SHIN = 32
     ANKLE = 64
+    BREAST = 128
 
     HEAD_DISCONNECTED = HEAD | DISCONNECTED
     HEAD_AND_TAIL = HEAD | TAIL
@@ -723,7 +742,7 @@ class BoneSnapInfo:
     daz_name: str
 
 
-ARP_REF_TO_DAZ_BONE_SNAP_INFOS: List[BoneSnapInfo] = reversed([
+ARP_REF_TO_DAZ_BONE_SNAP_INFOS: List[BoneSnapInfo] = list(reversed([
     BoneSnapInfo(BoneSnapType.TAIL_AND_HEAD, 'root_ref.x', 'pelvis'),
     BoneSnapInfo(BoneSnapType.HEAD_DISCONNECTED, 'spine_01_ref.x', 'abdomenLower'),
     BoneSnapInfo(BoneSnapType.HEAD, 'spine_02_ref.x', 'abdomenUpper'),
@@ -819,6 +838,9 @@ ARP_REF_TO_DAZ_BONE_SNAP_INFOS: List[BoneSnapInfo] = reversed([
     BoneSnapInfo(BoneSnapType.HEAD, 'subneck_1_ref.x', 'neckLower'),
     BoneSnapInfo(BoneSnapType.HEAD, 'neck_ref.x', 'neckUpper'),
     BoneSnapInfo(BoneSnapType.HEAD_AND_TAIL, 'head_ref.x', 'head'),
+
     BoneSnapInfo(BoneSnapType.HEAD_AND_TAIL, 'ear_01_ref.l', 'lEar'),
-    BoneSnapInfo(BoneSnapType.HEAD, 'breast_01_ref.l', 'lPectoral'),
-])
+    BoneSnapInfo(BoneSnapType.BREAST, 'breast_01_ref.l', 'lPectoral'),
+    BoneSnapInfo(BoneSnapType.HEAD_AND_TAIL, 'ear_01_ref.r', 'rEar'),
+    BoneSnapInfo(BoneSnapType.BREAST, 'breast_01_ref.r', 'rPectoral'),
+]))
