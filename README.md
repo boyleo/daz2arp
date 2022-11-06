@@ -16,3 +16,5 @@ Usage
 2. A new menu item call 'Convert Daz armature to AutoRig Pro' is in Object menu
 3. Move Daz3d mesh objects to the same collection as the AutoRig Pro armature.
 4. Optional : delete hierarchy DAZ_ROOT collection
+
+https://user-images.githubusercontent.com/70152495/200139546-9e6ac006-ef86-449d-9532-82652b887afb.mp4
