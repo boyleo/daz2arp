@@ -77,10 +77,10 @@ class D2A_OT_convert_daz_to_arp(bpy.types.Operator):
         return True
 
     def execute(self, context):
-        # bpy.ops.ed.undo_push()
-
         daz_armature_object = context.active_object
-        arp_armature_object = self._add_arp_rig(context)
+        daz_armature: bpy.types.Armature = daz_armature_object.data
+        daz_has_breast_bones = 'lPectoral' in daz_armature.bones
+        arp_armature_object = self._add_arp_rig(context, daz_has_breast_bones)
 
         bpy.ops.object.mode_set(mode='OBJECT')
         daz_armature_object.select_set(True)
@@ -106,6 +106,8 @@ class D2A_OT_convert_daz_to_arp(bpy.types.Operator):
         if self.remap_daz_corrective_shape_keys:
             _remap_daz_corrective_shape_keys(arp_armature_object, daz_armature_object, self.report)
 
+        arp_layer_collection = _find_user_layer_collection(arp_armature_object)
+
         if self.remap_daz_vertex_groups:
             daz_mesh_object: bpy.types.Object
             for daz_mesh_object in daz_armature_object.children:
@@ -114,6 +116,9 @@ class D2A_OT_convert_daz_to_arp(bpy.types.Operator):
 
                 _remap_daz_vertex_groups(daz_mesh_object, self.report)
                 daz_mesh_object.parent = arp_armature_object
+                daz_layer_collection = _find_user_layer_collection(daz_mesh_object)
+                arp_layer_collection.collection.objects.link(daz_mesh_object)
+                daz_layer_collection.collection.objects.unlink(daz_mesh_object)
 
                 for modifier in daz_mesh_object.modifiers:
                     if modifier.type != 'ARMATURE':
@@ -122,7 +127,7 @@ class D2A_OT_convert_daz_to_arp(bpy.types.Operator):
 
         return {'FINISHED'}
 
-    def _add_arp_rig(self, context: bpy.types.Context) -> bpy.types.Object:
+    def _add_arp_rig(self, context: bpy.types.Context, add_breast_bones: bool) -> bpy.types.Object:
         arp = _try_import_module('auto_rig_pro-master.auto_rig') or _try_import_module('auto_rig_pro.auto_rig')
         if arp is None:
             self.report({'ERROR'}, "Auto-Rig Pro is not installed.")
@@ -158,8 +163,9 @@ class D2A_OT_convert_daz_to_arp(bpy.types.Operator):
         # add ears
         arp.set_ears(1)
 
-        # add breast
-        arp.set_breast(True)
+        # add breast bones
+        if add_breast_bones:
+            arp.set_breast(True)
 
         return armature_object
 
@@ -303,14 +309,14 @@ def _copy_daz_constraints(arp_armature_object: bpy.types.Object, daz_armature_ob
     arp_bones = arp_armature_object.pose.bones
     daz_bones = daz_armature_object.pose.bones
 
-    for daz_bone in daz_bones:
-        roll_type, arp_bone_name, arp_parent_bone_name = ARP_BONE_LIMIT_ROTATION_BASES.get(daz_bone.name, (BoneRollType.ROLL_0, None, None))
+    for arp_bone in arp_bones:
+        roll_type, daz_bone_name, arp_parent_bone_name = ARP_BONE_LIMIT_ROTATION_BASES.get(arp_bone.name, (BoneRollType.ROLL_0, None, None))
 
-        arp_bone: bpy.types.PoseBone
-        if arp_bone_name is not None:
-            arp_bone = arp_bones[arp_bone_name]
-        elif daz_bone.name in arp_bones:
-            arp_bone = arp_bones[daz_bone.name]
+        daz_bone: bpy.types.PoseBone
+        if daz_bone_name is not None:
+            daz_bone = daz_bones[daz_bone_name]
+        elif arp_bone.name in daz_bones:
+            daz_bone = daz_bones[arp_bone.name]
         else:
             continue
 
@@ -331,20 +337,20 @@ def _copy_daz_constraints(arp_armature_object: bpy.types.Object, daz_armature_ob
                 ac.owner_space = dc.owner_space
                 continue
 
-            continue
             # TODO calculate the angle considering bone orientation and parent angle difference.
+            continue
             arp_parent_bone = arp_bones[arp_parent_bone_name]
             arp_parent_vector: Vector = arp_parent_bone.vector
             daz_parent_vector: Vector = daz_bone.parent.vector
             base_euler: Euler = arp_bone.vector.rotation_difference(daz_bone.vector).to_euler()
             parent_euler: Euler = arp_parent_bone.vector.rotation_difference(daz_bone.parent.vector).to_euler()
             daz_euler: Euler = arp_bone.vector.rotation_difference(daz_bone.parent.vector).to_euler()
-            ac.min_x += parent_euler.x - base_euler.x + daz_euler.x
-            ac.max_x += parent_euler.x - base_euler.x + daz_euler.x
-            ac.min_y += parent_euler.y - base_euler.y + daz_euler.y
-            ac.max_y += parent_euler.y - base_euler.y + daz_euler.y
-            ac.min_z += parent_euler.z - base_euler.z + daz_euler.z
-            ac.max_z += parent_euler.z - base_euler.z + daz_euler.z
+            ac.min_x += parent_euler.x - base_euler.x  # + daz_euler.x
+            ac.max_x += parent_euler.x - base_euler.x  # + daz_euler.x
+            ac.min_y += parent_euler.y - base_euler.y  # + daz_euler.y
+            ac.max_y += parent_euler.y - base_euler.y  # + daz_euler.y
+            ac.min_z += parent_euler.z - base_euler.z  # + daz_euler.z
+            ac.max_z += parent_euler.z - base_euler.z  # + daz_euler.z
 
             ac.owner_space = 'CUSTOM'
             ac.space_object = arp_armature_object
@@ -511,7 +517,32 @@ def _remap_daz_vertex_groups(daz_mesh_object: bpy.types.Object, report: Optional
     combine_vertex_group('foot.r', 'rMetatarsals')
 
 
-def menu_func(self, _context):
+def _find_user_layer_collection(target_object: bpy.types.Object) -> Optional[bpy.types.LayerCollection]:
+    context: bpy.types.Context = bpy.context
+    scene_layer_collection: bpy.types.LayerCollection = context.view_layer.layer_collection
+
+    def find_layer_collection_by_name(layer_collection: bpy.types.LayerCollection, name: str) -> Optional[bpy.types.LayerCollection]:
+        if layer_collection.name == name:
+            return layer_collection
+
+        child_layer_collection: bpy.types.LayerCollection
+        for child_layer_collection in layer_collection.children:
+            found = find_layer_collection_by_name(child_layer_collection, name)
+            if found is not None:
+                return found
+
+        return None
+
+    user_collection: bpy.types.Collection
+    for user_collection in target_object.users_collection:
+        found = find_layer_collection_by_name(scene_layer_collection, user_collection.name)
+        if found is not None:
+            return found
+
+    return None
+
+
+def _menu_func(self, _context):
     self.layout.operator(D2A_OT_convert_daz_to_arp.bl_idname, text=D2A_OT_convert_daz_to_arp.bl_label)
 
 
@@ -546,11 +577,11 @@ def register():
     _load_handler(None)
     bpy.app.handlers.load_post.append(_load_handler)
     bpy.utils.register_class(D2A_OT_convert_daz_to_arp)
-    bpy.types.VIEW3D_MT_object.append(menu_func)
+    bpy.types.VIEW3D_MT_object.append(_menu_func)
 
 
 def unregister():
-    bpy.types.VIEW3D_MT_object.remove(menu_func)
+    bpy.types.VIEW3D_MT_object.remove(_menu_func)
     bpy.utils.unregister_class(D2A_OT_convert_daz_to_arp)
     bpy.app.handlers.load_post.remove(_load_handler)
 
@@ -714,7 +745,18 @@ ARP_REF_BONE_ROLL_INFOS: Dict[str, BoneRollInfo] = {
     'head.x': BoneRollInfo(BoneRollType.ROLL_0, 'c_head.x'),
 }
 
-ARP_BONE_LIMIT_ROTATION_BASES = {}
+ARP_BONE_LIMIT_ROTATION_BASES = {
+    # 'c_spine_01.x': (BoneRollType.ROLL_0, 'abdomenLower', None),
+    # 'c_spine_02.x': (BoneRollType.ROLL_0, 'abdomenUpper', None),
+    # 'c_spine_03.x': (BoneRollType.ROLL_0, 'chestLower', None),
+    # 'c_spine_04.x': (BoneRollType.ROLL_0, 'chestUpper', None),
+    # 'c_shoulder.l': (BoneRollType.ROLL_0, 'lCollar', None),
+    # 'c_arm_fk.l': (BoneRollType.ROLL_0, 'lShldrBend', None),
+    # 'c_arm_ik.l': (BoneRollType.ROLL_0, 'lShldrBend', None),
+    # 'c_shoulder.r': (BoneRollType.ROLL_0, 'rCollar', None),
+    # 'c_arm_fk.r': (BoneRollType.ROLL_0, 'rShldrBend', None),
+    # 'c_arm_ik.r': (BoneRollType.ROLL_0, 'rShldrBend', None),
+}
 
 
 class BoneSnapType(Flag):
