@@ -1,9 +1,20 @@
-# Rename/Remix vertex groups from Daz 3D model to AutoRig Pro
-# --- limitations ---
-# - no secondary controllers
-# - edit limb option on spine for 4 spine bones to be compatible with UE4 mannequin
-# - edit limb options on both legs to have toe fingers
-# - add breasts / ears (1 bone)
+# -*- coding: utf-8 -*-
+# Copyright 2023 UuuNyaa <UuuNyaa@gmail.com>, boyleo https://github.com/boyleo/daz2arp
+# This file is part of Daz3D Tools.
+
+# Daz3D Tools is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3 of the License, or
+# (at your option) any later version.
+#
+# Daz3D Tools is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTIBILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+# General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <http://www.gnu.org/licenses/>.
+
 
 import ast
 import logging
@@ -19,13 +30,12 @@ import mathutils
 from mathutils import Vector, Euler
 
 bl_info = {
-    "name": "Daz2ARP",
+    "name": "Daz3D Tools",
     "author": "Boonsak Watanavisit",
-    "version": (1, 0),
+    "version": (1, 0, 0),
     "blender": (2, 93, 0),
     "location": "View3D",
     "description": "Rename/Remix vertex groups from Daz 3D model to AutoRig Pro",
-    "warning": "",
     "doc_url": "",
     "category": "Object",
 }
